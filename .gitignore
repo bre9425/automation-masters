@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local environments and secrets
+.env
+.venv/
+venv/
+
+# Research inputs and generated outputs
+data/
+images/
+inputs/
+outputs/
+*.dcm
+image_differentials*.csv
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/
