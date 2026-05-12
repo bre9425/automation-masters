@@ -170,6 +170,14 @@ def find_images(image_dir: Path) -> list[Path]:
     )
 
 
+def image_case_number(path: Path) -> str | None:
+    """Extract the leading case number from filenames like '1. 22-1391.jpg'."""
+    match = re.match(r"^\s*(\d+)\.\s+", path.name)
+    if not match:
+        return None
+    return str(int(match.group(1)))
+
+
 def read_location_rows(locations_csv: Path) -> list[dict[str, str]]:
     with locations_csv.open(newline="", encoding="utf-8-sig") as csv_file:
         reader = csv.DictReader(csv_file)
@@ -201,43 +209,35 @@ def read_location_rows(locations_csv: Path) -> list[dict[str, str]]:
     return rows
 
 
-def candidate_stems_for_case(case_id: str) -> set[str]:
-    stems = {case_id, f"case{case_id}", f"case_{case_id}", f"image{case_id}", f"image_{case_id}"}
-    if case_id.isdigit():
-        number = int(case_id)
-        stems.update(
-            {
-                str(number),
-                f"{number:02d}",
-                f"{number:03d}",
-                f"case{number}",
-                f"case_{number}",
-                f"case{number:02d}",
-                f"case_{number:02d}",
-                f"case{number:03d}",
-                f"case_{number:03d}",
-                f"image{number}",
-                f"image_{number}",
-                f"image{number:02d}",
-                f"image_{number:02d}",
-                f"image{number:03d}",
-                f"image_{number:03d}",
-            }
-        )
-    return {stem.lower() for stem in stems}
-
-
 def pair_cases_with_images(case_rows: list[dict[str, str]], image_paths: list[Path]) -> list[CaseInput]:
-    images_by_stem = {path.stem.lower(): path for path in image_paths}
+    images_by_case_number = {}
+    incorrectly_named_images = []
+
+    for path in image_paths:
+        case_number = image_case_number(path)
+        if case_number is None:
+            incorrectly_named_images.append(path.name)
+            continue
+        if case_number in images_by_case_number:
+            raise SystemExit(
+                f"Multiple images start with case number {case_number}: "
+                f"{images_by_case_number[case_number].name}, {path.name}"
+            )
+        images_by_case_number[case_number] = path
+
+    if incorrectly_named_images:
+        raise SystemExit(
+            "Image filenames must start with the case number followed by a period, "
+            "for example '1. 22-1391.jpg'. These files did not match: "
+            + ", ".join(incorrectly_named_images)
+        )
+
     paired_cases = []
     missing_case_ids = []
 
     for row in case_rows:
-        image_path = None
-        for stem in candidate_stems_for_case(row["case_id"]):
-            if stem in images_by_stem:
-                image_path = images_by_stem[stem]
-                break
+        case_id = str(int(row["case_id"])) if row["case_id"].isdigit() else row["case_id"]
+        image_path = images_by_case_number.get(case_id)
 
         if image_path is None:
             missing_case_ids.append(row["case_id"])
@@ -254,23 +254,10 @@ def pair_cases_with_images(case_rows: list[dict[str, str]], image_paths: list[Pa
     if not missing_case_ids:
         return paired_cases
 
-    if len(image_paths) == len(case_rows):
-        print(
-            "Could not match every case by filename, so falling back to natural image order."
-        )
-        return [
-            CaseInput(
-                case_id=row["case_id"],
-                location_description=row["location_description"],
-                image_path=image_path,
-            )
-            for row, image_path in zip(case_rows, image_paths)
-        ]
-
     raise SystemExit(
         "Could not match images for case IDs: "
         + ", ".join(missing_case_ids)
-        + ". Rename images like image1.jpg, image2.jpg, ... or provide the same number of images as CSV rows."
+        + ". Image names should start with the matching case number, for example '1. 22-1391.jpg'."
     )
 
 

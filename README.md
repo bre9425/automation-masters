@@ -80,9 +80,8 @@ python3 run_image_differentials.py images \
 ## Notes
 
 - Supported image formats: `.jpg`, `.jpeg`, `.png`, `.webp`.
-- Images are first matched to CSV cases by filenames like `image1.jpg`,
-  `case_001.jpg`, or `1.jpg`. If every case has exactly one image but names do
-  not match, the script falls back to natural filename order.
+- Images are matched to CSV cases by the leading number in filenames like
+  `1. 22-1391.jpg`, `2. 21-6118.jpg`, and so on.
 - The default model is `gpt-5.4-mini`.
 - The default temperature is `0.2`.
 - The default image detail setting is `high`.

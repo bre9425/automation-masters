@@ -14,6 +14,8 @@ images/
 inputs/
 outputs/
 *.dcm
+Locations*.csv
+locations*.csv
 image_differentials*.csv
 
 # OS/editor files
