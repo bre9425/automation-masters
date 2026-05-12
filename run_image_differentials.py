@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Run a differential diagnosis prompt over every image in a folder."""
+"""Run approved-list differentials for panoramic radiograph cases."""
 
 import argparse
 import base64
 import csv
-import json
 import mimetypes
+import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from openai import OpenAI
@@ -13,59 +14,137 @@ from openai import OpenAI
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
-PROMPT = """
-For this de-identified radiographic image, list the top 3 differential
-diagnoses based on the visible imaging findings.
+APPROVED_DIAGNOSES = [
+    "Adenomatoid Odontogenic Tumor",
+    "Ameloblastic Fibroma",
+    "Ameloblastoma (Conventional/Multicystic)",
+    "Ameloblastoma (Unicystic)",
+    "Amelogenesis Imperfecta",
+    "Aneurysmal Bone Cyst",
+    "Antrolith",
+    "Brown Tumour/Hyperparathyroidism",
+    "Buccal Bifurcation Cyst",
+    "Calcified Lymph Nodes",
+    "Calcifying Epithelial Odontogenic Tumor",
+    "Calcifying Odontogenic Cyst",
+    "Cementoblastoma",
+    "Cemento-Ossifying Fibroma",
+    "Central Giant Cell Granuloma",
+    "Central Odontogenic Fibroma",
+    "Cherubism",
+    "Cleft Lip and Palate",
+    "Cleidocranial Dysplasia",
+    "Complex Odontoma",
+    "Compound Odontoma",
+    "Craniofacial Dysostosis (Crouzon Syndrome)",
+    "Dentigerous Cyst",
+    "Dentin Dysplasia",
+    "Dentinogenesis Imperfecta",
+    "Desmoplastic Fibroma",
+    "Ectodermal Dysplasia",
+    "Familial Adenomatous Polyposis (Gardner's Syndrome)",
+    "Fibrous Dysplasia",
+    "Glandular Odontogenic Cyst",
+    "Hemangioma/Vascular Malformation",
+    "Hemifacial Hyperplasia",
+    "Hemifacial Microsomia",
+    "Hyperparathyroidism-Jaw Tumour Syndrome",
+    "Hypophosphatasia",
+    "Lateral Periodontal Cyst",
+    "Malignancy- Carcinoma",
+    "Malignancy- Hematolymphoid",
+    "Malignancy- Metastatic",
+    "Malignancy- Sarcoma",
+    "Mandibulofacial Dysostosis (Treacher Collins Syndrome)",
+    "Mucopolysaccharidosis",
+    "Mucous Retention Pseudocyst",
+    "Myositis Ossificans",
+    "Nasopalatine Duct Cyst",
+    "Neuroma/Neurofibroma/Schwannoma",
+    "Nevoid Basal Cell Carcinoma Syndrome (Gorlin-Goltz Syndrome)",
+    "Odontogenic Keratocyst",
+    "Odontogenic Myxoma",
+    "Orthokeratinized Cyst",
+    "Osteoblastoma/Osteoid Osteoma",
+    "Osteoma",
+    "Osteomyelitis/Medication-Related Osteonecrosis of the Jaw/Osteoradionecrosis",
+    "Osteopetrosis",
+    "Paget's Disease",
+    "Periapical Cemento-Osseous Dysplasia",
+    "Periapical Inflammatory Disease/Rarefying Osteitis (Including Radicular Cyst and Radicular Granuloma)",
+    "Pericoronitis",
+    "Periodontal Disease",
+    "Phlebolith",
+    "Pleomorphic Adenoma",
+    "RASopathies (Such as Noonan Syndrome or Neurofibromatosis Type 1)",
+    "Regional Odontodysplasia",
+    "Residual Cyst",
+    "Rhinolith",
+    "Rickets/Osteomalacia",
+    "Segmental Odontomaxillary Dysplasia",
+    "Sialolith",
+    "Sickle Cell Anemia/Thalassemia",
+    "Simple Bone Cyst",
+    "Stafne Bone Defect/Mandibular Lingual Bone Depression",
+    "Surgical Ciliated Cyst",
+    "Trauma/Fracture",
+]
 
-Return only the requested structured output. Do not include patient identifiers.
-If the image quality is insufficient, still provide your best assessment and
-explain the limitation.
-"""
+OUTPUT_COLUMNS = [
+    "differential_1",
+    "reasoning_1",
+    "differential_2",
+    "reasoning_2",
+    "differential_3",
+    "reasoning_3",
+]
 
-OUTPUT_SCHEMA = {
-    "type": "json_schema",
-    "name": "radiograph_differential",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "image_quality": {"type": "string"},
-            "overall_limitations": {"type": "string"},
-            "differential": {
-                "type": "array",
-                "minItems": 3,
-                "maxItems": 3,
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "rank": {"type": "integer"},
-                        "diagnosis": {"type": "string"},
-                        "confidence": {
-                            "type": "number",
-                            "minimum": 0,
-                            "maximum": 1,
-                        },
-                        "supporting_findings": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                        },
-                        "reasoning_summary": {"type": "string"},
-                    },
-                    "required": [
-                        "rank",
-                        "diagnosis",
-                        "confidence",
-                        "supporting_findings",
-                        "reasoning_summary",
-                    ],
-                },
-            },
-        },
-        "required": ["image_quality", "overall_limitations", "differential"],
-    },
-}
+RANKED_LINE_PATTERN = re.compile(
+    r"^\s*(?P<rank>[1-3])[\.\)]\s*(?P<diagnosis>.+?)\s+(?:\u2013|\u2014|-)\s+(?P<reasoning>.+?)\s*$"
+)
+
+
+@dataclass(frozen=True)
+class CaseInput:
+    case_id: str
+    location_description: str
+    image_path: Path
+
+
+def approved_diagnosis_list_text() -> str:
+    return "\n".join(
+        f"{index}. {diagnosis}" for index, diagnosis in enumerate(APPROVED_DIAGNOSES, start=1)
+    )
+
+
+def build_prompt(location_description: str) -> str:
+    return f"""You are asked to interpret a panoramic radiograph that contains an oral and maxillofacial pathologic lesion. A panoramic image may or may not be attached. You may be provided with a written radiographic description, a panoramic image, or both.
+
+Using ONLY the information provided in this chat (written radiographic description, panoramic image, or both), provide a ranked differential diagnosis using ONLY diagnoses from the approved list below.
+
+Instructions:
+1. Provide between 1 and 3 diagnoses only.
+2. Do NOT force 3 diagnoses if fewer are justified by the findings.
+3. Rank diagnoses from most likely to least likely.
+4. Use only diagnoses from the approved list exactly as written.
+5. Do not invent diagnoses or use diagnoses not listed.
+6. Base your answer only on the provided findings/image.
+7. If uncertainty is high, provide the most plausible limited differential based on available information.
+8. Keep the response concise.
+9. For each diagnosis, provide brief reasoning based only on the radiographic findings.
+10. Do not provide treatment recommendations or unrelated commentary.
+
+Written Radiographic Description:
+{location_description}
+
+Approved Diagnosis List:
+{approved_diagnosis_list_text()}
+
+Return your answer in exactly this format:
+
+1. [Most likely diagnosis] \u2013 [Brief radiographic reasoning]
+2. [Second diagnosis if justified] \u2013 [Brief radiographic reasoning]
+3. [Third diagnosis if justified] \u2013 [Brief radiographic reasoning]"""
 
 
 def image_to_data_url(path: Path) -> str:
@@ -74,15 +153,134 @@ def image_to_data_url(path: Path) -> str:
     return f"data:{mime_type};base64,{encoded}"
 
 
+def natural_sort_key(path: Path) -> list[object]:
+    parts = re.split(r"(\d+)", path.name.lower())
+    return [int(part) if part.isdigit() else part for part in parts]
+
+
 def find_images(image_dir: Path) -> list[Path]:
+    """Return supported image files in natural filename order."""
     return sorted(
-        path
-        for path in image_dir.iterdir()
-        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        (
+            path
+            for path in image_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        ),
+        key=natural_sort_key,
     )
 
 
-def request_differential(client: OpenAI, model: str, temperature: float, image_path: Path) -> dict:
+def read_location_rows(locations_csv: Path) -> list[dict[str, str]]:
+    with locations_csv.open(newline="", encoding="utf-8-sig") as csv_file:
+        reader = csv.DictReader(csv_file)
+        if not reader.fieldnames or len(reader.fieldnames) < 2:
+            raise SystemExit("Locations CSV must contain at least two columns.")
+
+        case_column = reader.fieldnames[0]
+        location_column = reader.fieldnames[1]
+        rows = []
+
+        for row in reader:
+            case_id = (row.get(case_column) or "").strip()
+            location_description = (row.get(location_column) or "").strip()
+            if not case_id and not location_description:
+                continue
+            if not case_id or not location_description:
+                raise SystemExit(
+                    f"Locations CSV row is missing a case ID or location description: {row}"
+                )
+            rows.append(
+                {
+                    "case_id": case_id,
+                    "location_description": location_description,
+                }
+            )
+
+    if not rows:
+        raise SystemExit("No case rows found in locations CSV.")
+    return rows
+
+
+def candidate_stems_for_case(case_id: str) -> set[str]:
+    stems = {case_id, f"case{case_id}", f"case_{case_id}", f"image{case_id}", f"image_{case_id}"}
+    if case_id.isdigit():
+        number = int(case_id)
+        stems.update(
+            {
+                str(number),
+                f"{number:02d}",
+                f"{number:03d}",
+                f"case{number}",
+                f"case_{number}",
+                f"case{number:02d}",
+                f"case_{number:02d}",
+                f"case{number:03d}",
+                f"case_{number:03d}",
+                f"image{number}",
+                f"image_{number}",
+                f"image{number:02d}",
+                f"image_{number:02d}",
+                f"image{number:03d}",
+                f"image_{number:03d}",
+            }
+        )
+    return {stem.lower() for stem in stems}
+
+
+def pair_cases_with_images(case_rows: list[dict[str, str]], image_paths: list[Path]) -> list[CaseInput]:
+    images_by_stem = {path.stem.lower(): path for path in image_paths}
+    paired_cases = []
+    missing_case_ids = []
+
+    for row in case_rows:
+        image_path = None
+        for stem in candidate_stems_for_case(row["case_id"]):
+            if stem in images_by_stem:
+                image_path = images_by_stem[stem]
+                break
+
+        if image_path is None:
+            missing_case_ids.append(row["case_id"])
+            continue
+
+        paired_cases.append(
+            CaseInput(
+                case_id=row["case_id"],
+                location_description=row["location_description"],
+                image_path=image_path,
+            )
+        )
+
+    if not missing_case_ids:
+        return paired_cases
+
+    if len(image_paths) == len(case_rows):
+        print(
+            "Could not match every case by filename, so falling back to natural image order."
+        )
+        return [
+            CaseInput(
+                case_id=row["case_id"],
+                location_description=row["location_description"],
+                image_path=image_path,
+            )
+            for row, image_path in zip(case_rows, image_paths)
+        ]
+
+    raise SystemExit(
+        "Could not match images for case IDs: "
+        + ", ".join(missing_case_ids)
+        + ". Rename images like image1.jpg, image2.jpg, ... or provide the same number of images as CSV rows."
+    )
+
+
+def request_differential(
+    client: OpenAI,
+    model: str,
+    temperature: float,
+    detail: str,
+    case_input: CaseInput,
+) -> str:
     response = client.responses.create(
         model=model,
         temperature=temperature,
@@ -90,87 +288,138 @@ def request_differential(client: OpenAI, model: str, temperature: float, image_p
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_text", "text": PROMPT.strip()},
+                    {"type": "input_text", "text": build_prompt(case_input.location_description)},
                     {
                         "type": "input_image",
-                        "image_url": image_to_data_url(image_path),
-                        "detail": "high",
+                        "image_url": image_to_data_url(case_input.image_path),
+                        "detail": detail,
                     },
                 ],
             }
         ],
-        text={"format": OUTPUT_SCHEMA},
     )
-    return json.loads(response.output_text)
+    return response.output_text.strip()
 
 
-def write_csv(rows: list[dict], output_path: Path) -> None:
-    fieldnames = [
-        "image_filename",
-        "model",
-        "temperature",
-        "image_quality",
-        "overall_limitations",
-        "rank",
-        "diagnosis",
-        "confidence",
-        "supporting_findings",
-        "reasoning_summary",
-    ]
+def clean_diagnosis(value: str) -> str:
+    return value.strip().strip("[]").strip("*").strip()
 
+
+def clean_reasoning(value: str) -> str:
+    return value.strip().strip("[]").strip("*").strip()
+
+
+def parse_ranked_response(response_text: str) -> list[dict[str, str]]:
+    diagnoses = []
+    for line in response_text.splitlines():
+        match = RANKED_LINE_PATTERN.match(line)
+        if not match:
+            continue
+        diagnoses.append(
+            {
+                "diagnosis": clean_diagnosis(match.group("diagnosis")),
+                "reasoning": clean_reasoning(match.group("reasoning")),
+            }
+        )
+
+    if not diagnoses:
+        raise ValueError(f"Could not parse ranked differential response: {response_text}")
+
+    return diagnoses[:3]
+
+
+def response_to_output_row(response_text: str) -> dict[str, str]:
+    parsed_items = parse_ranked_response(response_text)
+    row = {column: "" for column in OUTPUT_COLUMNS}
+
+    for index, item in enumerate(parsed_items, start=1):
+        row[f"differential_{index}"] = item["diagnosis"]
+        row[f"reasoning_{index}"] = item["reasoning"]
+
+    return row
+
+
+def write_csv(rows: list[dict[str, str]], output_path: Path) -> None:
     with output_path.open("w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer = csv.DictWriter(csv_file, fieldnames=OUTPUT_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Ask OpenAI for the top 3 differential diagnoses for each image."
+        description="Ask OpenAI for approved-list differential diagnoses for each case."
     )
     parser.add_argument("image_dir", type=Path, help="Folder containing de-identified images")
+    parser.add_argument(
+        "--locations-csv",
+        type=Path,
+        required=True,
+        help="CSV where column 1 is case ID and column 2 is location description",
+    )
     parser.add_argument("--output", type=Path, default=Path("image_differentials.csv"))
     parser.add_argument("--model", default="gpt-5.4-mini")
     parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--detail", choices=["low", "high", "auto"], default="high")
+    parser.add_argument("--runs-per-case", type=int, default=3)
+    parser.add_argument(
+        "--limit-cases",
+        type=int,
+        help="Limit the number of CSV cases processed, useful for low-cost pilot runs",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print planned case/image pairs without calling the API",
+    )
     args = parser.parse_args()
 
     if not args.image_dir.exists() or not args.image_dir.is_dir():
         raise SystemExit(f"Image folder not found: {args.image_dir}")
+    if not args.locations_csv.exists() or not args.locations_csv.is_file():
+        raise SystemExit(f"Locations CSV not found: {args.locations_csv}")
+    if args.runs_per_case < 1:
+        raise SystemExit("--runs-per-case must be at least 1")
+
+    case_rows = read_location_rows(args.locations_csv)
+    if args.limit_cases is not None:
+        if args.limit_cases < 1:
+            raise SystemExit("--limit-cases must be at least 1")
+        case_rows = case_rows[: args.limit_cases]
 
     image_paths = find_images(args.image_dir)
     if not image_paths:
         raise SystemExit(f"No supported images found in: {args.image_dir}")
 
+    cases = pair_cases_with_images(case_rows, image_paths)
+
+    print(f"Prepared {len(cases)} cases x {args.runs_per_case} run(s) per case.")
+    for case_input in cases:
+        print(f"Case {case_input.case_id}: {case_input.image_path.name}")
+
+    if args.dry_run:
+        print("Dry run complete. No API calls were made.")
+        return
+
     client = OpenAI()
-    rows = []
+    output_rows = []
 
-    for image_path in image_paths:
-        print(f"Processing {image_path.name}...")
-        result = request_differential(
-            client=client,
-            model=args.model,
-            temperature=args.temperature,
-            image_path=image_path,
-        )
-
-        for item in result["differential"]:
-            rows.append(
-                {
-                    "image_filename": image_path.name,
-                    "model": args.model,
-                    "temperature": args.temperature,
-                    "image_quality": result["image_quality"],
-                    "overall_limitations": result["overall_limitations"],
-                    "rank": item["rank"],
-                    "diagnosis": item["diagnosis"],
-                    "confidence": item["confidence"],
-                    "supporting_findings": " | ".join(item["supporting_findings"]),
-                    "reasoning_summary": item["reasoning_summary"],
-                }
+    for case_input in cases:
+        for run_number in range(1, args.runs_per_case + 1):
+            print(
+                f"Processing case {case_input.case_id}, run {run_number}/{args.runs_per_case}..."
             )
+            response_text = request_differential(
+                client=client,
+                model=args.model,
+                temperature=args.temperature,
+                detail=args.detail,
+                case_input=case_input,
+            )
+            output_rows.append(response_to_output_row(response_text))
 
-    write_csv(rows, args.output)
-    print(f"Saved {len(rows)} rows to {args.output}")
+    write_csv(output_rows, args.output)
+    print(f"Saved {len(output_rows)} rows to {args.output}")
 
 
 if __name__ == "__main__":
