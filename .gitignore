@@ -20,6 +20,8 @@ Radiologist*.csv
 radiologist*.csv
 image_differentials*.csv
 pilot_differentials*.csv
+pilot_*.csv
+*_differentials*.csv
 prompt_preview*.txt
 
 # OS/editor files

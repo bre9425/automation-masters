@@ -92,6 +92,7 @@ APPROVED_DIAGNOSES = [
 
 OUTPUT_COLUMNS = [
     "description_source",
+    "input_modality",
     "radiologist_id",
     "case_id",
     "image_filename",
@@ -326,22 +327,26 @@ def request_differential(
     model: str,
     temperature: float,
     detail: str,
+    input_modality: str,
     case_input: CaseInput,
 ) -> str:
+    content = [{"type": "input_text", "text": build_prompt(case_input.written_description)}]
+    if input_modality == "image-and-text":
+        content.append(
+            {
+                "type": "input_image",
+                "image_url": image_to_data_url(case_input.image_path),
+                "detail": detail,
+            }
+        )
+
     response = client.responses.create(
         model=model,
         temperature=temperature,
         input=[
             {
                 "role": "user",
-                "content": [
-                    {"type": "input_text", "text": build_prompt(case_input.written_description)},
-                    {
-                        "type": "input_image",
-                        "image_url": image_to_data_url(case_input.image_path),
-                        "detail": detail,
-                    },
-                ],
+                "content": content,
             }
         ],
     )
@@ -378,6 +383,7 @@ def parse_ranked_response(response_text: str) -> list[dict[str, str]]:
 def response_to_output_row(
     response_text: str,
     description_source: str,
+    input_modality: str,
     case_input: CaseInput,
     run_number: int,
 ) -> dict[str, str]:
@@ -386,6 +392,7 @@ def response_to_output_row(
     row.update(
         {
             "description_source": description_source,
+            "input_modality": input_modality,
             "radiologist_id": case_input.radiologist_id,
             "case_id": case_input.case_id,
             "image_filename": case_input.image_path.name,
@@ -456,6 +463,12 @@ def main() -> None:
     parser.add_argument("--model", default="gpt-5.4-mini")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--detail", choices=["low", "high", "auto"], default="high")
+    parser.add_argument(
+        "--input-modality",
+        choices=["image-and-text", "text-only"],
+        default="image-and-text",
+        help="Attach each image plus text, or send only the written description",
+    )
     parser.add_argument("--runs-per-case", type=int, default=3)
     parser.add_argument(
         "--limit-cases",
@@ -492,7 +505,10 @@ def main() -> None:
 
     cases = pair_cases_with_images(case_rows, image_paths)
 
-    print(f"Prepared {len(cases)} cases x {args.runs_per_case} run(s) per case.")
+    print(
+        f"Prepared {len(cases)} cases x {args.runs_per_case} run(s) per case "
+        f"with {args.input_modality} input."
+    )
     for case_input in cases:
         if case_input.radiologist_id:
             print(
@@ -520,12 +536,14 @@ def main() -> None:
                 model=args.model,
                 temperature=args.temperature,
                 detail=args.detail,
+                input_modality=args.input_modality,
                 case_input=case_input,
             )
             output_rows.append(
                 response_to_output_row(
                     response_text=response_text,
                     description_source=args.description_source,
+                    input_modality=args.input_modality,
                     case_input=case_input,
                     run_number=run_number,
                 )
