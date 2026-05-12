@@ -50,7 +50,7 @@ in order.
 ## Setup
 
 ```bash
-cd /Users/breanna/Documents/Codex/2026-05-07/is-there-a-way-to-automate
+cd /Users/breanna/Documents/Codex/2026-05-07/openai-prompt-automation
 source .venv/bin/activate
 ```
 
