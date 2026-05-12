@@ -460,7 +460,7 @@ def main() -> None:
         help="CSV containing repeated Radiographic Description columns for each image",
     )
     parser.add_argument("--output", type=Path, default=Path("image_differentials.csv"))
-    parser.add_argument("--model", default="gpt-5.4-mini")
+    parser.add_argument("--model", default="gpt-5.4-2026-03-05")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--detail", choices=["low", "high", "auto"], default="high")
     parser.add_argument(
