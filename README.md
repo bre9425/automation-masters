@@ -195,6 +195,5 @@ Example:
 - Images are matched to CSV cases by the leading number in the filename.
 - The default model is `gpt-5.4-2026-03-05`.
 - The default temperature is `0.2`.
-- The default image detail setting is `high`.
 - Generated output CSVs, local input CSVs, images, `.env`, and virtual
   environments are ignored by git.

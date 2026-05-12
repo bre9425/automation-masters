@@ -326,7 +326,6 @@ def request_differential(
     client: OpenAI,
     model: str,
     temperature: float,
-    detail: str,
     input_modality: str,
     case_input: CaseInput,
 ) -> str:
@@ -336,7 +335,6 @@ def request_differential(
             {
                 "type": "input_image",
                 "image_url": image_to_data_url(case_input.image_path),
-                "detail": detail,
             }
         )
 
@@ -462,7 +460,6 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("image_differentials.csv"))
     parser.add_argument("--model", default="gpt-5.4-2026-03-05")
     parser.add_argument("--temperature", type=float, default=0.2)
-    parser.add_argument("--detail", choices=["low", "high", "auto"], default="high")
     parser.add_argument(
         "--input-modality",
         choices=["image-and-text", "text-only"],
@@ -535,7 +532,6 @@ def main() -> None:
                 client=client,
                 model=args.model,
                 temperature=args.temperature,
-                detail=args.detail,
                 input_modality=args.input_modality,
                 case_input=case_input,
             )
