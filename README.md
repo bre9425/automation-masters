@@ -6,7 +6,7 @@ Responses API and saves the ranked differential diagnosis output to a CSV file.
 Each case combines:
 
 - one image from the image folder
-- one location description from the locations CSV
+- one written radiographic description from a CSV
 - the approved diagnosis list prompt in `run_image_differentials.py`
 
 It is intended for approved research workflows where identifiers have already
@@ -23,8 +23,11 @@ export OPENAI_API_KEY="your_api_key_here"
 
 ## Run
 
+### Location Description Mode
+
 ```bash
 python3 run_image_differentials.py /path/to/images \
+  --description-source locations \
   --locations-csv "/path/to/Locations.csv" \
   --output image_differentials.csv
 ```
@@ -33,6 +36,7 @@ Optional settings:
 
 ```bash
 python3 run_image_differentials.py /path/to/images \
+  --description-source locations \
   --locations-csv "/path/to/Locations.csv" \
   --model gpt-5.4-mini \
   --temperature 0.2 \
@@ -41,17 +45,38 @@ python3 run_image_differentials.py /path/to/images \
   --output image_differentials.csv
 ```
 
-The output CSV contains one row per model run and six columns:
+The output CSV contains one row per model run and 11 columns:
 
-1. `differential_1`
-2. `reasoning_1`
-3. `differential_2`
-4. `reasoning_2`
-5. `differential_3`
-6. `reasoning_3`
+1. `description_source`
+2. `radiologist_id`
+3. `case_id`
+4. `image_filename`
+5. `run_number`
+6. `differential_1`
+7. `reasoning_1`
+8. `differential_2`
+9. `reasoning_2`
+10. `differential_3`
+11. `reasoning_3`
 
 With 20 cases and `--runs-per-case 3`, the output should contain 60 data rows
 plus a header row.
+
+### Radiologist Description Mode
+
+Use this mode for the CSV where each row is one radiologist and the repeated
+`Radiographic Description` columns correspond to images 1-20 in order.
+
+```bash
+python3 run_image_differentials.py images \
+  --description-source radiologist \
+  --radiologist-csv "Radiologist Interpretations 1.csv" \
+  --runs-per-case 3 \
+  --output radiologist_image_differentials.csv
+```
+
+With 5 radiologists, 20 cases, and `--runs-per-case 3`, the output should
+contain 300 data rows plus a header row.
 
 ## No-cost dry run
 
@@ -59,7 +84,20 @@ Use `--dry-run` to verify case/image pairing without making API calls:
 
 ```bash
 python3 run_image_differentials.py images \
-  --locations-csv "/Users/breanna/Downloads/Locations 2(Sheet1).csv" \
+  --description-source locations \
+  --locations-csv "Locations 2(Sheet1).csv" \
+  --limit-cases 2 \
+  --runs-per-case 1 \
+  --dry-run
+```
+
+Radiologist description dry run:
+
+```bash
+python3 run_image_differentials.py images \
+  --description-source radiologist \
+  --radiologist-csv "Radiologist Interpretations 1.csv" \
+  --limit-radiologists 1 \
   --limit-cases 2 \
   --runs-per-case 1 \
   --dry-run
@@ -71,10 +109,23 @@ To make only one API call:
 
 ```bash
 python3 run_image_differentials.py images \
-  --locations-csv "/Users/breanna/Downloads/Locations 2(Sheet1).csv" \
+  --description-source locations \
+  --locations-csv "Locations 2(Sheet1).csv" \
   --limit-cases 1 \
   --runs-per-case 1 \
   --output pilot_differentials.csv
+```
+
+To make only one radiologist-description API call:
+
+```bash
+python3 run_image_differentials.py images \
+  --description-source radiologist \
+  --radiologist-csv "Radiologist Interpretations 1.csv" \
+  --limit-radiologists 1 \
+  --limit-cases 1 \
+  --runs-per-case 1 \
+  --output pilot_radiologist_differentials.csv
 ```
 
 ## Notes

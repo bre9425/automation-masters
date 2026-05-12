@@ -16,7 +16,11 @@ outputs/
 *.dcm
 Locations*.csv
 locations*.csv
+Radiologist*.csv
+radiologist*.csv
 image_differentials*.csv
+pilot_differentials*.csv
+prompt_preview*.txt
 
 # OS/editor files
 .DS_Store

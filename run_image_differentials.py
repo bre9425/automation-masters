@@ -91,6 +91,11 @@ APPROVED_DIAGNOSES = [
 ]
 
 OUTPUT_COLUMNS = [
+    "description_source",
+    "radiologist_id",
+    "case_id",
+    "image_filename",
+    "run_number",
     "differential_1",
     "reasoning_1",
     "differential_2",
@@ -107,8 +112,9 @@ RANKED_LINE_PATTERN = re.compile(
 @dataclass(frozen=True)
 class CaseInput:
     case_id: str
-    location_description: str
     image_path: Path
+    written_description: str
+    radiologist_id: str = ""
 
 
 def approved_diagnosis_list_text() -> str:
@@ -117,7 +123,7 @@ def approved_diagnosis_list_text() -> str:
     )
 
 
-def build_prompt(location_description: str) -> str:
+def build_prompt(written_description: str) -> str:
     return f"""You are asked to interpret a panoramic radiograph that contains an oral and maxillofacial pathologic lesion. A panoramic image may or may not be attached. You may be provided with a written radiographic description, a panoramic image, or both.
 
 Using ONLY the information provided in this chat (written radiographic description, panoramic image, or both), provide a ranked differential diagnosis using ONLY diagnoses from the approved list below.
@@ -135,7 +141,7 @@ Instructions:
 10. Do not provide treatment recommendations or unrelated commentary.
 
 Written Radiographic Description:
-{location_description}
+{written_description}
 
 Approved Diagnosis List:
 {approved_diagnosis_list_text()}
@@ -190,23 +196,76 @@ def read_location_rows(locations_csv: Path) -> list[dict[str, str]]:
 
         for row in reader:
             case_id = (row.get(case_column) or "").strip()
-            location_description = (row.get(location_column) or "").strip()
-            if not case_id and not location_description:
+            written_description = (row.get(location_column) or "").strip()
+            if not case_id and not written_description:
                 continue
-            if not case_id or not location_description:
+            if not case_id or not written_description:
                 raise SystemExit(
                     f"Locations CSV row is missing a case ID or location description: {row}"
                 )
             rows.append(
                 {
                     "case_id": case_id,
-                    "location_description": location_description,
+                    "written_description": written_description,
                 }
             )
 
     if not rows:
         raise SystemExit("No case rows found in locations CSV.")
     return rows
+
+
+def read_radiologist_description_rows(
+    radiologist_csv: Path,
+    limit_cases: int | None = None,
+    limit_radiologists: int | None = None,
+) -> list[dict[str, str]]:
+    with radiologist_csv.open(newline="", encoding="utf-8-sig") as csv_file:
+        rows = list(csv.reader(csv_file))
+
+    if len(rows) < 2:
+        raise SystemExit("Radiologist CSV must contain a header row and at least one data row.")
+
+    headers = rows[0]
+    description_indices = [
+        index
+        for index, header in enumerate(headers)
+        if header.strip().lower() == "radiographic description"
+    ]
+
+    if not description_indices:
+        raise SystemExit("No 'Radiographic Description' columns found in radiologist CSV.")
+    if limit_cases is not None:
+        description_indices = description_indices[:limit_cases]
+
+    case_rows = []
+    data_rows = rows[1:]
+    if limit_radiologists is not None:
+        data_rows = data_rows[:limit_radiologists]
+
+    for radiologist_number, row in enumerate(data_rows, start=1):
+        if not any(cell.strip() for cell in row):
+            continue
+
+        radiologist_id = row[0].strip() if row and row[0].strip() else str(radiologist_number)
+        for case_number, description_index in enumerate(description_indices, start=1):
+            written_description = row[description_index].strip() if description_index < len(row) else ""
+            if not written_description:
+                raise SystemExit(
+                    f"Missing radiographic description for radiologist {radiologist_id}, "
+                    f"case {case_number}."
+                )
+            case_rows.append(
+                {
+                    "case_id": str(case_number),
+                    "written_description": written_description,
+                    "radiologist_id": radiologist_id,
+                }
+            )
+
+    if not case_rows:
+        raise SystemExit("No radiologist description rows found in radiologist CSV.")
+    return case_rows
 
 
 def pair_cases_with_images(case_rows: list[dict[str, str]], image_paths: list[Path]) -> list[CaseInput]:
@@ -246,8 +305,9 @@ def pair_cases_with_images(case_rows: list[dict[str, str]], image_paths: list[Pa
         paired_cases.append(
             CaseInput(
                 case_id=row["case_id"],
-                location_description=row["location_description"],
                 image_path=image_path,
+                written_description=row["written_description"],
+                radiologist_id=row.get("radiologist_id", ""),
             )
         )
 
@@ -257,7 +317,7 @@ def pair_cases_with_images(case_rows: list[dict[str, str]], image_paths: list[Pa
     raise SystemExit(
         "Could not match images for case IDs: "
         + ", ".join(missing_case_ids)
-        + ". Image names should start with the matching case number, for example '1. 22-1391.jpg'."
+                        + ". Image names should start with the matching case number, for example '1. 22-1391.jpg'."
     )
 
 
@@ -275,7 +335,7 @@ def request_differential(
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_text", "text": build_prompt(case_input.location_description)},
+                    {"type": "input_text", "text": build_prompt(case_input.written_description)},
                     {
                         "type": "input_image",
                         "image_url": image_to_data_url(case_input.image_path),
@@ -315,9 +375,23 @@ def parse_ranked_response(response_text: str) -> list[dict[str, str]]:
     return diagnoses[:3]
 
 
-def response_to_output_row(response_text: str) -> dict[str, str]:
+def response_to_output_row(
+    response_text: str,
+    description_source: str,
+    case_input: CaseInput,
+    run_number: int,
+) -> dict[str, str]:
     parsed_items = parse_ranked_response(response_text)
     row = {column: "" for column in OUTPUT_COLUMNS}
+    row.update(
+        {
+            "description_source": description_source,
+            "radiologist_id": case_input.radiologist_id,
+            "case_id": case_input.case_id,
+            "image_filename": case_input.image_path.name,
+            "run_number": str(run_number),
+        }
+    )
 
     for index, item in enumerate(parsed_items, start=1):
         row[f"differential_{index}"] = item["diagnosis"]
@@ -333,16 +407,50 @@ def write_csv(rows: list[dict[str, str]], output_path: Path) -> None:
         writer.writerows(rows)
 
 
+def load_case_rows(args: argparse.Namespace) -> list[dict[str, str]]:
+    if args.description_source == "locations":
+        if args.locations_csv is None:
+            raise SystemExit("--locations-csv is required when --description-source locations")
+        if not args.locations_csv.exists() or not args.locations_csv.is_file():
+            raise SystemExit(f"Locations CSV not found: {args.locations_csv}")
+
+        case_rows = read_location_rows(args.locations_csv)
+        if args.limit_cases is not None:
+            case_rows = case_rows[: args.limit_cases]
+        return case_rows
+
+    if args.radiologist_csv is None:
+        raise SystemExit("--radiologist-csv is required when --description-source radiologist")
+    if not args.radiologist_csv.exists() or not args.radiologist_csv.is_file():
+        raise SystemExit(f"Radiologist CSV not found: {args.radiologist_csv}")
+
+    return read_radiologist_description_rows(
+        args.radiologist_csv,
+        limit_cases=args.limit_cases,
+        limit_radiologists=args.limit_radiologists,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Ask OpenAI for approved-list differential diagnoses for each case."
     )
     parser.add_argument("image_dir", type=Path, help="Folder containing de-identified images")
     parser.add_argument(
+        "--description-source",
+        choices=["locations", "radiologist"],
+        default="locations",
+        help="Use the 20-row locations CSV or the 5-row radiologist descriptions CSV",
+    )
+    parser.add_argument(
         "--locations-csv",
         type=Path,
-        required=True,
         help="CSV where column 1 is case ID and column 2 is location description",
+    )
+    parser.add_argument(
+        "--radiologist-csv",
+        type=Path,
+        help="CSV containing repeated Radiographic Description columns for each image",
     )
     parser.add_argument("--output", type=Path, default=Path("image_differentials.csv"))
     parser.add_argument("--model", default="gpt-5.4-mini")
@@ -352,7 +460,12 @@ def main() -> None:
     parser.add_argument(
         "--limit-cases",
         type=int,
-        help="Limit the number of CSV cases processed, useful for low-cost pilot runs",
+        help="Limit the number of cases/images processed, useful for low-cost pilot runs",
+    )
+    parser.add_argument(
+        "--limit-radiologists",
+        type=int,
+        help="Limit the number of radiologist rows processed in radiologist mode",
     )
     parser.add_argument(
         "--dry-run",
@@ -363,16 +476,15 @@ def main() -> None:
 
     if not args.image_dir.exists() or not args.image_dir.is_dir():
         raise SystemExit(f"Image folder not found: {args.image_dir}")
-    if not args.locations_csv.exists() or not args.locations_csv.is_file():
-        raise SystemExit(f"Locations CSV not found: {args.locations_csv}")
     if args.runs_per_case < 1:
         raise SystemExit("--runs-per-case must be at least 1")
-
-    case_rows = read_location_rows(args.locations_csv)
     if args.limit_cases is not None:
         if args.limit_cases < 1:
             raise SystemExit("--limit-cases must be at least 1")
-        case_rows = case_rows[: args.limit_cases]
+    if args.limit_radiologists is not None and args.limit_radiologists < 1:
+        raise SystemExit("--limit-radiologists must be at least 1")
+
+    case_rows = load_case_rows(args)
 
     image_paths = find_images(args.image_dir)
     if not image_paths:
@@ -382,7 +494,13 @@ def main() -> None:
 
     print(f"Prepared {len(cases)} cases x {args.runs_per_case} run(s) per case.")
     for case_input in cases:
-        print(f"Case {case_input.case_id}: {case_input.image_path.name}")
+        if case_input.radiologist_id:
+            print(
+                f"Radiologist {case_input.radiologist_id}, case {case_input.case_id}: "
+                f"{case_input.image_path.name}"
+            )
+        else:
+            print(f"Case {case_input.case_id}: {case_input.image_path.name}")
 
     if args.dry_run:
         print("Dry run complete. No API calls were made.")
@@ -393,9 +511,10 @@ def main() -> None:
 
     for case_input in cases:
         for run_number in range(1, args.runs_per_case + 1):
-            print(
-                f"Processing case {case_input.case_id}, run {run_number}/{args.runs_per_case}..."
-            )
+            label = f"case {case_input.case_id}"
+            if case_input.radiologist_id:
+                label = f"radiologist {case_input.radiologist_id}, {label}"
+            print(f"Processing {label}, run {run_number}/{args.runs_per_case}...")
             response_text = request_differential(
                 client=client,
                 model=args.model,
@@ -403,7 +522,14 @@ def main() -> None:
                 detail=args.detail,
                 case_input=case_input,
             )
-            output_rows.append(response_to_output_row(response_text))
+            output_rows.append(
+                response_to_output_row(
+                    response_text=response_text,
+                    description_source=args.description_source,
+                    case_input=case_input,
+                    run_number=run_number,
+                )
+            )
 
     write_csv(output_rows, args.output)
     print(f"Saved {len(output_rows)} rows to {args.output}")
