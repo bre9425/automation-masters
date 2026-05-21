@@ -90,7 +90,7 @@ APPROVED_DIAGNOSES = [
     "Trauma/Fracture",
 ]
 
-OUTPUT_COLUMNS = [
+DIFFERENTIAL_OUTPUT_COLUMNS = [
     "description_source",
     "input_modality",
     "radiologist_id",
@@ -105,6 +105,20 @@ OUTPUT_COLUMNS = [
     "reasoning_3",
 ]
 
+LLM_DIFFERENTIAL_OUTPUT_COLUMNS = [
+    column for column in DIFFERENTIAL_OUTPUT_COLUMNS if column != "radiologist_id"
+]
+
+DESCRIPTION_OUTPUT_COLUMNS = [
+    "description_source",
+    "input_modality",
+    "case_id",
+    "image_filename",
+    "run_number",
+    "location_description",
+    "generated_description",
+]
+
 RANKED_LINE_PATTERN = re.compile(
     r"^\s*(?P<rank>[1-3])[\.\)]\s*(?P<diagnosis>.+?)\s+(?:\u2013|\u2014|-)\s+(?P<reasoning>.+?)\s*$"
 )
@@ -116,6 +130,7 @@ class CaseInput:
     image_path: Path
     written_description: str
     radiologist_id: str = ""
+    source_run_number: str = ""
 
 
 def approved_diagnosis_list_text() -> str:
@@ -152,6 +167,29 @@ Return your answer in exactly this format:
 1. [Most likely diagnosis] \u2013 [Brief radiographic reasoning]
 2. [Second diagnosis if justified] \u2013 [Brief radiographic reasoning]
 3. [Third diagnosis if justified] \u2013 [Brief radiographic reasoning]"""
+
+
+def build_description_prompt(location_description: str) -> str:
+    return f"""You are acting as an oral and maxillofacial radiologist reviewing a panoramic radiograph for descriptive purposes only.
+
+Please provide a written radiographic description of the visible pathologic lesion. Do not provide a clinical impression, diagnosis, differential diagnosis, etiologic explanation, prognosis, or treatment recommendation.
+
+Location of pathologic lesion:
+{location_description}
+
+Describe only what is visible on the image using objective radiographic terminology. Include, when applicable:
+
+- Anatomic location of the lesion
+- Shape and overall configuration
+- Margins/borders, including whether well-defined, corticated, sclerotic, or ill-defined
+- Internal radiographic appearance, such as radiolucent, radiopaque, or mixed density
+- Unilocular or multilocular appearance, if applicable
+- Relationship to adjacent teeth
+- Effects on adjacent structures, including displacement, root resorption, cortical expansion, thinning, perforation, or involvement of the mandibular canal, maxillary sinus, nasal floor, or other landmarks
+
+Use a professional radiology-style narrative format.
+
+End the response after the descriptive findings only."""
 
 
 def image_to_data_url(path: Path) -> str:
@@ -269,6 +307,52 @@ def read_radiologist_description_rows(
     return case_rows
 
 
+def read_llm_description_rows(
+    llm_description_csv: Path,
+    limit_cases: int | None = None,
+) -> list[dict[str, str]]:
+    with llm_description_csv.open(newline="", encoding="utf-8-sig") as csv_file:
+        reader = csv.DictReader(csv_file)
+        required_columns = {"case_id", "generated_description"}
+        if not reader.fieldnames or not required_columns.issubset(reader.fieldnames):
+            raise SystemExit(
+                "LLM description CSV must contain case_id and generated_description columns."
+            )
+
+        rows = []
+        included_case_ids = []
+        for row in reader:
+            case_id = (row.get("case_id") or "").strip()
+            written_description = (row.get("generated_description") or "").strip()
+            if not case_id and not written_description:
+                continue
+            if not case_id or not written_description:
+                raise SystemExit(
+                    f"LLM description CSV row is missing a case ID or generated description: {row}"
+                )
+
+            normalized_case_id = str(int(case_id)) if case_id.isdigit() else case_id
+            if limit_cases is not None:
+                if normalized_case_id not in included_case_ids:
+                    if len(included_case_ids) >= limit_cases:
+                        continue
+                    included_case_ids.append(normalized_case_id)
+                elif normalized_case_id not in included_case_ids:
+                    continue
+
+            rows.append(
+                {
+                    "case_id": case_id,
+                    "written_description": written_description,
+                    "source_run_number": (row.get("run_number") or "").strip(),
+                }
+            )
+
+    if not rows:
+        raise SystemExit("No generated description rows found in LLM description CSV.")
+    return rows
+
+
 def pair_cases_with_images(case_rows: list[dict[str, str]], image_paths: list[Path]) -> list[CaseInput]:
     images_by_case_number = {}
     incorrectly_named_images = []
@@ -309,6 +393,7 @@ def pair_cases_with_images(case_rows: list[dict[str, str]], image_paths: list[Pa
                 image_path=image_path,
                 written_description=row["written_description"],
                 radiologist_id=row.get("radiologist_id", ""),
+                source_run_number=row.get("source_run_number", ""),
             )
         )
 
@@ -322,19 +407,19 @@ def pair_cases_with_images(case_rows: list[dict[str, str]], image_paths: list[Pa
     )
 
 
-def request_differential(
+def request_openai_response(
     client: OpenAI,
     model: str,
     temperature: float,
-    input_modality: str,
-    case_input: CaseInput,
+    prompt: str,
+    image_path: Path | None,
 ) -> str:
-    content = [{"type": "input_text", "text": build_prompt(case_input.written_description)}]
-    if input_modality == "image-and-text":
+    content = [{"type": "input_text", "text": prompt}]
+    if image_path is not None:
         content.append(
             {
                 "type": "input_image",
-                "image_url": image_to_data_url(case_input.image_path),
+                "image_url": image_to_data_url(image_path),
             }
         )
 
@@ -349,6 +434,38 @@ def request_differential(
         ],
     )
     return response.output_text.strip()
+
+
+def request_differential(
+    client: OpenAI,
+    model: str,
+    temperature: float,
+    input_modality: str,
+    case_input: CaseInput,
+) -> str:
+    image_path = case_input.image_path if input_modality == "image-and-text" else None
+    return request_openai_response(
+        client=client,
+        model=model,
+        temperature=temperature,
+        prompt=build_prompt(case_input.written_description),
+        image_path=image_path,
+    )
+
+
+def request_description(
+    client: OpenAI,
+    model: str,
+    temperature: float,
+    case_input: CaseInput,
+) -> str:
+    return request_openai_response(
+        client=client,
+        model=model,
+        temperature=temperature,
+        prompt=build_description_prompt(case_input.written_description),
+        image_path=case_input.image_path,
+    )
 
 
 def clean_diagnosis(value: str) -> str:
@@ -383,10 +500,10 @@ def response_to_output_row(
     description_source: str,
     input_modality: str,
     case_input: CaseInput,
-    run_number: int,
+    run_number: int | str,
 ) -> dict[str, str]:
     parsed_items = parse_ranked_response(response_text)
-    row = {column: "" for column in OUTPUT_COLUMNS}
+    row = {column: "" for column in DIFFERENTIAL_OUTPUT_COLUMNS}
     row.update(
         {
             "description_source": description_source,
@@ -405,11 +522,41 @@ def response_to_output_row(
     return row
 
 
-def write_csv(rows: list[dict[str, str]], output_path: Path) -> None:
+def response_to_description_row(
+    response_text: str,
+    description_source: str,
+    input_modality: str,
+    case_input: CaseInput,
+    run_number: int | str,
+) -> dict[str, str]:
+    return {
+        "description_source": description_source,
+        "input_modality": input_modality,
+        "case_id": case_input.case_id,
+        "image_filename": case_input.image_path.name,
+        "run_number": str(run_number),
+        "location_description": case_input.written_description,
+        "generated_description": response_text.strip(),
+    }
+
+
+def write_csv(rows: list[dict[str, str]], output_path: Path, fieldnames: list[str]) -> None:
     with output_path.open("w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=OUTPUT_COLUMNS)
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def output_input_modality(args: argparse.Namespace) -> str:
+    if args.task == "description" and args.input_modality == "image-and-text":
+        return "image-and-text2"
+    return args.input_modality
+
+
+def output_description_source(args: argparse.Namespace) -> str:
+    if args.description_source == "llm":
+        return "LLM"
+    return args.description_source
 
 
 def load_case_rows(args: argparse.Namespace) -> list[dict[str, str]]:
@@ -423,6 +570,16 @@ def load_case_rows(args: argparse.Namespace) -> list[dict[str, str]]:
         if args.limit_cases is not None:
             case_rows = case_rows[: args.limit_cases]
         return case_rows
+
+    if args.description_source == "llm":
+        if args.llm_description_csv is None:
+            raise SystemExit("--llm-description-csv is required when --description-source llm")
+        if not args.llm_description_csv.exists() or not args.llm_description_csv.is_file():
+            raise SystemExit(f"LLM description CSV not found: {args.llm_description_csv}")
+        return read_llm_description_rows(
+            args.llm_description_csv,
+            limit_cases=args.limit_cases,
+        )
 
     if args.radiologist_csv is None:
         raise SystemExit("--radiologist-csv is required when --description-source radiologist")
@@ -438,14 +595,20 @@ def load_case_rows(args: argparse.Namespace) -> list[dict[str, str]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Ask OpenAI for approved-list differential diagnoses for each case."
+        description="Ask OpenAI for differential diagnoses or radiographic descriptions for each case."
     )
     parser.add_argument("image_dir", type=Path, help="Folder containing de-identified images")
     parser.add_argument(
+        "--task",
+        choices=["differential", "description"],
+        default="differential",
+        help="Ask for approved-list differentials or descriptive radiographic findings",
+    )
+    parser.add_argument(
         "--description-source",
-        choices=["locations", "radiologist"],
+        choices=["locations", "radiologist", "llm"],
         default="locations",
-        help="Use the 20-row locations CSV or the 5-row radiologist descriptions CSV",
+        help="Use locations, radiologist descriptions, or generated LLM descriptions",
     )
     parser.add_argument(
         "--locations-csv",
@@ -457,7 +620,12 @@ def main() -> None:
         type=Path,
         help="CSV containing repeated Radiographic Description columns for each image",
     )
-    parser.add_argument("--output", type=Path, default=Path("image_differentials.csv"))
+    parser.add_argument(
+        "--llm-description-csv",
+        type=Path,
+        help="CSV produced by --task description, containing generated_description rows",
+    )
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--model", default="gpt-5.4-2026-03-05")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument(
@@ -466,7 +634,7 @@ def main() -> None:
         default="image-and-text",
         help="Attach each image plus text, or send only the written description",
     )
-    parser.add_argument("--runs-per-case", type=int, default=3)
+    parser.add_argument("--runs-per-case", type=int)
     parser.add_argument(
         "--limit-cases",
         type=int,
@@ -486,6 +654,8 @@ def main() -> None:
 
     if not args.image_dir.exists() or not args.image_dir.is_dir():
         raise SystemExit(f"Image folder not found: {args.image_dir}")
+    if args.runs_per_case is None:
+        args.runs_per_case = 1 if args.description_source == "llm" else 3
     if args.runs_per_case < 1:
         raise SystemExit("--runs-per-case must be at least 1")
     if args.limit_cases is not None:
@@ -493,6 +663,23 @@ def main() -> None:
             raise SystemExit("--limit-cases must be at least 1")
     if args.limit_radiologists is not None and args.limit_radiologists < 1:
         raise SystemExit("--limit-radiologists must be at least 1")
+    if args.output is None:
+        if args.task == "description":
+            args.output = Path("image_descriptions.csv")
+        elif args.description_source == "llm":
+            args.output = Path("llm_description_differentials.csv")
+        else:
+            args.output = Path("image_differentials.csv")
+    if args.task == "description":
+        if args.description_source != "locations":
+            raise SystemExit("--task description requires --description-source locations")
+        if args.input_modality != "image-and-text":
+            raise SystemExit("--task description requires --input-modality image-and-text")
+    if args.description_source == "llm":
+        if args.task != "differential":
+            raise SystemExit("--description-source llm requires --task differential")
+        if args.input_modality != "text-only":
+            raise SystemExit("--description-source llm requires --input-modality text-only")
 
     case_rows = load_case_rows(args)
 
@@ -501,16 +688,24 @@ def main() -> None:
         raise SystemExit(f"No supported images found in: {args.image_dir}")
 
     cases = pair_cases_with_images(case_rows, image_paths)
+    saved_input_modality = output_input_modality(args)
+    saved_description_source = output_description_source(args)
+    input_label = "generated descriptions" if args.description_source == "llm" else "cases"
 
     print(
-        f"Prepared {len(cases)} cases x {args.runs_per_case} run(s) per case "
-        f"with {args.input_modality} input."
+        f"Prepared {len(cases)} {input_label} x {args.runs_per_case} run(s) per input "
+        f"with {saved_input_modality} input."
     )
     for case_input in cases:
         if case_input.radiologist_id:
             print(
                 f"Radiologist {case_input.radiologist_id}, case {case_input.case_id}: "
                 f"{case_input.image_path.name}"
+            )
+        elif case_input.source_run_number:
+            print(
+                f"LLM description case {case_input.case_id}, "
+                f"source run {case_input.source_run_number}: {case_input.image_path.name}"
             )
         else:
             print(f"Case {case_input.case_id}: {case_input.image_path.name}")
@@ -527,25 +722,51 @@ def main() -> None:
             label = f"case {case_input.case_id}"
             if case_input.radiologist_id:
                 label = f"radiologist {case_input.radiologist_id}, {label}"
+            elif case_input.source_run_number:
+                label = f"LLM description {label}, source run {case_input.source_run_number}"
+            output_run_number = case_input.source_run_number or run_number
             print(f"Processing {label}, run {run_number}/{args.runs_per_case}...")
-            response_text = request_differential(
-                client=client,
-                model=args.model,
-                temperature=args.temperature,
-                input_modality=args.input_modality,
-                case_input=case_input,
-            )
-            output_rows.append(
-                response_to_output_row(
-                    response_text=response_text,
-                    description_source=args.description_source,
+            if args.task == "description":
+                response_text = request_description(
+                    client=client,
+                    model=args.model,
+                    temperature=args.temperature,
+                    case_input=case_input,
+                )
+                output_rows.append(
+                    response_to_description_row(
+                        response_text=response_text,
+                        description_source=saved_description_source,
+                        input_modality=saved_input_modality,
+                        case_input=case_input,
+                        run_number=output_run_number,
+                    )
+                )
+            else:
+                response_text = request_differential(
+                    client=client,
+                    model=args.model,
+                    temperature=args.temperature,
                     input_modality=args.input_modality,
                     case_input=case_input,
-                    run_number=run_number,
                 )
-            )
+                output_rows.append(
+                    response_to_output_row(
+                        response_text=response_text,
+                        description_source=saved_description_source,
+                        input_modality=saved_input_modality,
+                        case_input=case_input,
+                        run_number=output_run_number,
+                    )
+                )
 
-    write_csv(output_rows, args.output)
+    if args.task == "description":
+        output_columns = DESCRIPTION_OUTPUT_COLUMNS
+    elif args.description_source == "llm":
+        output_columns = LLM_DIFFERENTIAL_OUTPUT_COLUMNS
+    else:
+        output_columns = DIFFERENTIAL_OUTPUT_COLUMNS
+    write_csv(output_rows, args.output, output_columns)
     print(f"Saved {len(output_rows)} rows to {args.output}")
 
 

@@ -28,3 +28,7 @@ prompt_preview*.txt
 .DS_Store
 .idea/
 .vscode/
+Description Prompt.pdf
+*_descriptions*.csv
+*description_prompt*.txt
+last_*_prompt.txt
